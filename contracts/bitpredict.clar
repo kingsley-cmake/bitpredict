@@ -227,3 +227,117 @@
     (ok true)
   )
 )
+
+;; Claim Proportional Winnings from Resolved Markets
+;; Enables winners to claim their proportional share of the total prize pool
+(define-public (claim-winnings (market-id uint))
+  (let (
+      (market-data (unwrap! (map-get? markets market-id) ERR-NOT-FOUND))
+      (user-prediction (unwrap!
+        (map-get? user-predictions {
+          market-id: market-id,
+          user: tx-sender,
+        })
+        ERR-NOT-FOUND
+      ))
+    )
+    ;; Resolution and claim status validation
+    (asserts! (get resolved market-data) ERR-MARKET-NOT-RESOLVED)
+    (asserts! (not (get claimed user-prediction)) ERR-ALREADY-CLAIMED)
+    (let (
+        ;; Determine winning prediction based on price movement
+        (winning-direction (if (> (get end-price market-data) (get start-price market-data))
+          "up"
+          "down"
+        ))
+        (total-pool (+ (get total-up-stake market-data) (get total-down-stake market-data)))
+        (winning-pool (if (is-eq winning-direction "up")
+          (get total-up-stake market-data)
+          (get total-down-stake market-data)
+        ))
+        (user-stake (get stake-amount user-prediction))
+      )
+      ;; Verify user made winning prediction
+      (asserts! (is-eq (get prediction-type user-prediction) winning-direction)
+        ERR-INVALID-PREDICTION
+      )
+      (asserts! (> winning-pool u0) ERR-INVALID-PARAMETER)
+      ;; Prevent division by zero
+      (let (
+          ;; Calculate proportional winnings and platform fees
+          (gross-winnings (/ (* user-stake total-pool) winning-pool))
+          (platform-fee (/ (* gross-winnings (var-get platform-fee-rate)) u10000))
+          (net-payout (- gross-winnings platform-fee))
+        )
+        ;; Execute secure payout transfers
+        (try! (as-contract (stx-transfer? net-payout (as-contract tx-sender) tx-sender)))
+        (try! (as-contract (stx-transfer? platform-fee (as-contract tx-sender) CONTRACT-OWNER)))
+        ;; Mark prediction as claimed to prevent double-spending
+        (map-set user-predictions {
+          market-id: market-id,
+          user: tx-sender,
+        }
+          (merge user-prediction {
+            claimed: true,
+            potential-payout: net-payout,
+          })
+        )
+        ;; Update user win statistics for performance tracking
+        (update-user-win-stats tx-sender net-payout)
+        (ok net-payout)
+      )
+    )
+  )
+)
+
+;; READ-ONLY FUNCTIONS - DATA QUERIES & ANALYTICS
+
+;; Retrieve Complete Market Information
+;; Returns comprehensive market data including all parameters and current state
+(define-read-only (get-market-details (market-id uint))
+  (map-get? markets market-id)
+)
+
+;; Get User's Specific Prediction Data
+;; Returns detailed prediction information for user in specific market
+(define-read-only (get-user-prediction-details
+    (market-id uint)
+    (user-address principal)
+  )
+  (map-get? user-predictions {
+    market-id: market-id,
+    user: user-address,
+  })
+)
+
+;; Calculate Potential Winnings for Active Predictions
+;; Estimates potential payout based on current pool ratios and stake distribution
+(define-read-only (calculate-potential-winnings
+    (market-id uint)
+    (user-address principal)
+  )
+  (let (
+      (market-data (unwrap! (map-get? markets market-id) (err u0)))
+      (user-prediction (unwrap!
+        (map-get? user-predictions {
+          market-id: market-id,
+          user: user-address,
+        })
+        (err u0)
+      ))
+    )
+    (let (
+        (total-pool (+ (get total-up-stake market-data) (get total-down-stake market-data)))
+        (user-stake (get stake-amount user-prediction))
+        (relevant-pool (if (is-eq (get prediction-type user-prediction) "up")
+          (get total-up-stake market-data)
+          (get total-down-stake market-data)
+        ))
+      )
+      (if (> relevant-pool u0)
+        (ok (/ (* user-stake total-pool) relevant-pool))
+        (ok u0)
+      )
+    )
+  )
+)
