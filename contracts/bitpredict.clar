@@ -1,0 +1,482 @@
+;; Title: BitPredict - Bitcoin Price Prediction Protocol
+;;
+;; Summary: A sophisticated decentralized prediction market leveraging Stacks Layer 2
+;;          to create trustless Bitcoin price forecasting with automated settlements,
+;;          proportional rewards, and community-driven oracle validation.
+;;
+;; Description: 
+;;   BitPredict transforms Bitcoin price speculation into a transparent, fair, and
+;;   profitable DeFi experience. Built natively on Stacks blockchain, our protocol
+;;   enables users to stake STX tokens on Bitcoin's directional movements within
+;;   time-bounded prediction windows. The system features oracle-based price feeds,
+;;   anti-manipulation safeguards, and proportional reward distribution that ensures
+;;   winners receive fair compensation based on their stake and market participation.
+;;
+;;   Key innovations include dynamic fee structures, comprehensive user analytics,
+;;   configurable market parameters, and full Bitcoin Layer 2 integration that
+;;   maintains the security and decentralization principles of the Bitcoin network
+;;   while enabling sophisticated financial primitives.
+;;
+;; Features:
+;;   - Trustless oracle integration for accurate price settlement
+;;   - Proportional reward pools with transparent distribution mechanics
+;;   - Dynamic market creation with customizable time windows
+;;   - Comprehensive anti-manipulation and minimum stake safeguards
+;;   - Real-time user performance tracking and analytics
+;;   - Administrative controls for platform optimization
+;;   - Full Stacks Layer 2 compatibility with Bitcoin security inheritance
+
+;; SYSTEM CONSTANTS & ERROR HANDLING
+
+;; Administrative & Security Constants
+(define-constant CONTRACT-OWNER tx-sender)
+(define-constant MAX-FEE-PERCENTAGE u10) ;; 10% maximum platform fee cap
+(define-constant MIN-MARKET-DURATION u10) ;; Minimum 10 blocks for market duration
+(define-constant MAX-STAKE-LIMIT u100000000) ;; Maximum 100 STX stake limit
+
+;; Comprehensive Error Code System
+(define-constant ERR-OWNER-ONLY (err u100)) ;; Unauthorized administrative access
+(define-constant ERR-NOT-FOUND (err u101)) ;; Resource not found in storage
+(define-constant ERR-INVALID-PREDICTION (err u102)) ;; Invalid prediction parameters
+(define-constant ERR-MARKET-CLOSED (err u103)) ;; Market outside active window
+(define-constant ERR-ALREADY-CLAIMED (err u104)) ;; Reward already claimed
+(define-constant ERR-INSUFFICIENT-BALANCE (err u105)) ;; Insufficient STX balance
+(define-constant ERR-INVALID-PARAMETER (err u106)) ;; Invalid function parameter
+(define-constant ERR-MARKET-NOT-RESOLVED (err u107)) ;; Market resolution pending
+(define-constant ERR-UNAUTHORIZED-ORACLE (err u108)) ;; Oracle authorization failure
+
+;; PLATFORM CONFIGURATION & STATE
+
+;; Core Platform Variables
+(define-data-var oracle-address principal 'ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM)
+(define-data-var minimum-stake uint u1000000) ;; 1 STX minimum (1,000,000 microSTX)
+(define-data-var platform-fee-rate uint u250) ;; 2.5% platform fee (250 basis points)
+(define-data-var market-counter uint u0) ;; Global market identifier counter
+(define-data-var total-volume uint u0) ;; Cumulative platform volume tracking
+
+;; CORE DATA STRUCTURES & STORAGE MAPS
+
+;; Primary Market Data Structure
+(define-map markets
+  uint ;; market-id (primary key)
+  {
+    start-price: uint, ;; Bitcoin price at market initialization (satoshis)
+    end-price: uint, ;; Bitcoin price at market resolution (satoshis)
+    total-up-stake: uint, ;; Total STX staked on bullish predictions
+    total-down-stake: uint, ;; Total STX staked on bearish predictions
+    start-block: uint, ;; Block height when predictions begin
+    end-block: uint, ;; Block height when prediction window closes
+    resolution-block: uint, ;; Block height of market resolution
+    resolved: bool, ;; Market resolution status flag
+    creator: principal, ;; Market creator principal address
+  }
+)
+
+;; User Prediction Tracking System
+(define-map user-predictions
+  {
+    market-id: uint,
+    user: principal,
+  }
+  ;; composite key
+  {
+    prediction-type: (string-ascii 4), ;; "up" or "down" direction
+    stake-amount: uint, ;; STX amount staked (microSTX)
+    timestamp: uint, ;; Block height of prediction submission
+    claimed: bool, ;; Reward claim status flag
+    potential-payout: uint, ;; Calculated potential winnings
+  }
+)
+
+;; Comprehensive User Statistics
+(define-map user-stats
+  principal ;; user address
+  {
+    total-predictions: uint, ;; Lifetime prediction count
+    total-staked: uint, ;; Cumulative STX staked amount
+    total-won: uint, ;; Total winnings claimed
+    win-rate: uint, ;; Win percentage (basis points)
+  }
+)
+
+;; PUBLIC FUNCTIONS - MARKET LIFECYCLE MANAGEMENT
+
+;; Create New Bitcoin Price Prediction Market
+;; Initializes a new prediction market with comprehensive validation and configuration
+(define-public (create-market
+    (start-price uint)
+    (start-block uint)
+    (end-block uint)
+  )
+  (let (
+      (new-market-id (var-get market-counter))
+      (current-block stacks-block-height)
+    )
+    ;; Administrative authorization check
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-OWNER-ONLY)
+    ;; Comprehensive parameter validation
+    (asserts! (> end-block start-block) ERR-INVALID-PARAMETER)
+    (asserts! (> start-price u0) ERR-INVALID-PARAMETER)
+    (asserts! (>= start-block current-block) ERR-INVALID-PARAMETER)
+    (asserts! (>= (- end-block start-block) MIN-MARKET-DURATION)
+      ERR-INVALID-PARAMETER
+    )
+    ;; Initialize market with complete data structure
+    (map-set markets new-market-id {
+      start-price: start-price,
+      end-price: u0,
+      total-up-stake: u0,
+      total-down-stake: u0,
+      start-block: start-block,
+      end-block: end-block,
+      resolution-block: u0,
+      resolved: false,
+      creator: tx-sender,
+    })
+    ;; Increment global counter for next market
+    (var-set market-counter (+ new-market-id u1))
+    (ok new-market-id)
+  )
+)
+
+;; Oracle-Driven Market Resolution System
+;; Authorized oracle resolves market with final Bitcoin price for automated settlement
+(define-public (resolve-market
+    (market-id uint)
+    (final-price uint)
+  )
+  (let (
+      (market-data (unwrap! (map-get? markets market-id) ERR-NOT-FOUND))
+      (current-block stacks-block-height)
+    )
+    ;; Oracle authorization and timing validation
+    (asserts! (is-eq tx-sender (var-get oracle-address)) ERR-UNAUTHORIZED-ORACLE)
+    (asserts! (>= current-block (get end-block market-data)) ERR-MARKET-CLOSED)
+    (asserts! (not (get resolved market-data)) ERR-MARKET-CLOSED)
+    (asserts! (> final-price u0) ERR-INVALID-PARAMETER)
+    ;; Update market with comprehensive resolution data
+    (map-set markets market-id
+      (merge market-data {
+        end-price: final-price,
+        resolution-block: current-block,
+        resolved: true,
+      })
+    )
+    (ok true)
+  )
+)
+
+;; PUBLIC FUNCTIONS - USER PARTICIPATION & STAKING
+
+;; Submit Price Prediction with STX Stake
+;; Enables users to stake STX tokens on Bitcoin price direction within active markets
+(define-public (make-prediction
+    (market-id uint)
+    (prediction-direction (string-ascii 4))
+    (stake-amount uint)
+  )
+  (let (
+      (market-data (unwrap! (map-get? markets market-id) ERR-NOT-FOUND))
+      (current-block stacks-block-height)
+      (user-balance (stx-get-balance tx-sender))
+    )
+    ;; Market timing and parameter validation
+    (asserts!
+      (and
+        (>= current-block (get start-block market-data))
+        (< current-block (get end-block market-data))
+      )
+      ERR-MARKET-CLOSED
+    )
+    (asserts!
+      (or (is-eq prediction-direction "up") (is-eq prediction-direction "down"))
+      ERR-INVALID-PREDICTION
+    )
+    (asserts! (>= stake-amount (var-get minimum-stake)) ERR-INVALID-PARAMETER)
+    (asserts! (<= stake-amount MAX-STAKE-LIMIT) ERR-INVALID-PARAMETER)
+    (asserts! (<= stake-amount user-balance) ERR-INSUFFICIENT-BALANCE)
+    ;; Execute STX transfer to contract for secure escrow
+    (try! (stx-transfer? stake-amount tx-sender (as-contract tx-sender)))
+    ;; Record comprehensive user prediction data
+    (map-set user-predictions {
+      market-id: market-id,
+      user: tx-sender,
+    } {
+      prediction-type: prediction-direction,
+      stake-amount: stake-amount,
+      timestamp: current-block,
+      claimed: false,
+      potential-payout: u0,
+    })
+    ;; Update market stake totals for accurate pool calculation
+    (map-set markets market-id
+      (merge market-data {
+        total-up-stake: (if (is-eq prediction-direction "up")
+          (+ (get total-up-stake market-data) stake-amount)
+          (get total-up-stake market-data)
+        ),
+        total-down-stake: (if (is-eq prediction-direction "down")
+          (+ (get total-down-stake market-data) stake-amount)
+          (get total-down-stake market-data)
+        ),
+      })
+    )
+    ;; Update platform volume tracking and user statistics
+    (var-set total-volume (+ (var-get total-volume) stake-amount))
+    (update-user-stats tx-sender stake-amount)
+    (ok true)
+  )
+)
+
+;; Claim Proportional Winnings from Resolved Markets
+;; Enables winners to claim their proportional share of the total prize pool
+(define-public (claim-winnings (market-id uint))
+  (let (
+      (market-data (unwrap! (map-get? markets market-id) ERR-NOT-FOUND))
+      (user-prediction (unwrap!
+        (map-get? user-predictions {
+          market-id: market-id,
+          user: tx-sender,
+        })
+        ERR-NOT-FOUND
+      ))
+    )
+    ;; Resolution and claim status validation
+    (asserts! (get resolved market-data) ERR-MARKET-NOT-RESOLVED)
+    (asserts! (not (get claimed user-prediction)) ERR-ALREADY-CLAIMED)
+    (let (
+        ;; Determine winning prediction based on price movement
+        (winning-direction (if (> (get end-price market-data) (get start-price market-data))
+          "up"
+          "down"
+        ))
+        (total-pool (+ (get total-up-stake market-data) (get total-down-stake market-data)))
+        (winning-pool (if (is-eq winning-direction "up")
+          (get total-up-stake market-data)
+          (get total-down-stake market-data)
+        ))
+        (user-stake (get stake-amount user-prediction))
+      )
+      ;; Verify user made winning prediction
+      (asserts! (is-eq (get prediction-type user-prediction) winning-direction)
+        ERR-INVALID-PREDICTION
+      )
+      (asserts! (> winning-pool u0) ERR-INVALID-PARAMETER)
+      ;; Prevent division by zero
+      (let (
+          ;; Calculate proportional winnings and platform fees
+          (gross-winnings (/ (* user-stake total-pool) winning-pool))
+          (platform-fee (/ (* gross-winnings (var-get platform-fee-rate)) u10000))
+          (net-payout (- gross-winnings platform-fee))
+        )
+        ;; Execute secure payout transfers
+        (try! (as-contract (stx-transfer? net-payout (as-contract tx-sender) tx-sender)))
+        (try! (as-contract (stx-transfer? platform-fee (as-contract tx-sender) CONTRACT-OWNER)))
+        ;; Mark prediction as claimed to prevent double-spending
+        (map-set user-predictions {
+          market-id: market-id,
+          user: tx-sender,
+        }
+          (merge user-prediction {
+            claimed: true,
+            potential-payout: net-payout,
+          })
+        )
+        ;; Update user win statistics for performance tracking
+        (update-user-win-stats tx-sender net-payout)
+        (ok net-payout)
+      )
+    )
+  )
+)
+
+;; READ-ONLY FUNCTIONS - DATA QUERIES & ANALYTICS
+
+;; Retrieve Complete Market Information
+;; Returns comprehensive market data including all parameters and current state
+(define-read-only (get-market-details (market-id uint))
+  (map-get? markets market-id)
+)
+
+;; Get User's Specific Prediction Data
+;; Returns detailed prediction information for user in specific market
+(define-read-only (get-user-prediction-details
+    (market-id uint)
+    (user-address principal)
+  )
+  (map-get? user-predictions {
+    market-id: market-id,
+    user: user-address,
+  })
+)
+
+;; Calculate Potential Winnings for Active Predictions
+;; Estimates potential payout based on current pool ratios and stake distribution
+(define-read-only (calculate-potential-winnings
+    (market-id uint)
+    (user-address principal)
+  )
+  (let (
+      (market-data (unwrap! (map-get? markets market-id) (err u0)))
+      (user-prediction (unwrap!
+        (map-get? user-predictions {
+          market-id: market-id,
+          user: user-address,
+        })
+        (err u0)
+      ))
+    )
+    (let (
+        (total-pool (+ (get total-up-stake market-data) (get total-down-stake market-data)))
+        (user-stake (get stake-amount user-prediction))
+        (relevant-pool (if (is-eq (get prediction-type user-prediction) "up")
+          (get total-up-stake market-data)
+          (get total-down-stake market-data)
+        ))
+      )
+      (if (> relevant-pool u0)
+        (ok (/ (* user-stake total-pool) relevant-pool))
+        (ok u0)
+      )
+    )
+  )
+)
+
+;; Get Current Platform Statistics
+;; Returns comprehensive platform metrics and configuration parameters
+(define-read-only (get-platform-stats)
+  {
+    total-markets: (var-get market-counter),
+    total-volume: (var-get total-volume),
+    minimum-stake: (var-get minimum-stake),
+    platform-fee-rate: (var-get platform-fee-rate),
+    oracle-address: (var-get oracle-address),
+    contract-balance: (stx-get-balance (as-contract tx-sender)),
+  }
+)
+
+;; Get User Performance Statistics
+;; Returns comprehensive user performance metrics and historical data
+(define-read-only (get-user-performance (user-address principal))
+  (map-get? user-stats user-address)
+)
+
+;; Check Market Status and Eligibility
+;; Determines current market state and prediction eligibility
+(define-read-only (get-market-status (market-id uint))
+  (let (
+      (market-data (unwrap! (map-get? markets market-id) (err "Market not found")))
+      (current-block stacks-block-height)
+    )
+    (ok {
+      is-active: (and
+        (>= current-block (get start-block market-data))
+        (< current-block (get end-block market-data))
+        (not (get resolved market-data))
+      ),
+      is-resolved: (get resolved market-data),
+      blocks-remaining: (if (< current-block (get end-block market-data))
+        (- (get end-block market-data) current-block)
+        u0
+      ),
+    })
+  )
+)
+
+;; ADMINISTRATIVE FUNCTIONS - PLATFORM GOVERNANCE
+
+;; Update Authorized Oracle Address
+;; Changes the oracle address authorized to resolve prediction markets
+(define-public (update-oracle-address (new-oracle-address principal))
+  (let ((old-oracle (var-get oracle-address)))
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-OWNER-ONLY)
+    ;; Validate the new oracle address is a standard principal
+    (asserts! (is-standard new-oracle-address) ERR-INVALID-PARAMETER)
+    ;; Additional safety check: ensure it's not the zero address equivalent
+    (asserts! (not (is-eq new-oracle-address 'SP000000000000000000002Q6VF78))
+      ERR-INVALID-PARAMETER
+    )
+    ;; Ensure we're actually changing the oracle (not setting to same address)
+    (asserts! (not (is-eq old-oracle new-oracle-address)) ERR-INVALID-PARAMETER)
+    (var-set oracle-address new-oracle-address)
+    ;; Emit event for transparency (using print for logging)
+    (print {
+      event: "oracle-updated",
+      old-oracle: old-oracle,
+      new-oracle: new-oracle-address,
+      block-height: stacks-block-height,
+    })
+    (ok true)
+  )
+)
+
+;; Adjust Minimum Stake Requirements
+;; Updates the minimum STX amount required for predictions
+(define-public (update-minimum-stake (new-minimum-amount uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-OWNER-ONLY)
+    (asserts! (> new-minimum-amount u0) ERR-INVALID-PARAMETER)
+    (asserts! (<= new-minimum-amount MAX-STAKE-LIMIT) ERR-INVALID-PARAMETER)
+    (ok (var-set minimum-stake new-minimum-amount))
+  )
+)
+
+;; Modify Platform Fee Structure
+;; Updates the platform fee percentage within acceptable limits
+(define-public (update-platform-fee (new-fee-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-OWNER-ONLY)
+    (asserts! (<= new-fee-rate u1000) ERR-INVALID-PARAMETER) ;; Maximum 10%
+    (ok (var-set platform-fee-rate new-fee-rate))
+  )
+)
+
+;; Withdraw Accumulated Platform Fees
+;; Allows contract owner to withdraw earned platform fees securely
+(define-public (withdraw-platform-fees (withdrawal-amount uint))
+  (let ((contract-balance (stx-get-balance (as-contract tx-sender))))
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-OWNER-ONLY)
+    (asserts! (<= withdrawal-amount contract-balance) ERR-INSUFFICIENT-BALANCE)
+    (asserts! (> withdrawal-amount u0) ERR-INVALID-PARAMETER)
+    (try! (as-contract (stx-transfer? withdrawal-amount (as-contract tx-sender) CONTRACT-OWNER)))
+    (ok withdrawal-amount)
+  )
+)
+
+;; PRIVATE UTILITY FUNCTIONS - INTERNAL OPERATIONS
+
+;; Update User Statistical Data
+;; Internal function to maintain comprehensive user participation statistics
+(define-private (update-user-stats
+    (user-address principal)
+    (stake-amount uint)
+  )
+  (let ((current-stats (default-to {
+      total-predictions: u0,
+      total-staked: u0,
+      total-won: u0,
+      win-rate: u0,
+    }
+      (map-get? user-stats user-address)
+    )))
+    (map-set user-stats user-address {
+      total-predictions: (+ (get total-predictions current-stats) u1),
+      total-staked: (+ (get total-staked current-stats) stake-amount),
+      total-won: (get total-won current-stats),
+      win-rate: (get win-rate current-stats),
+    })
+  )
+)
+
+;; Update User Win Statistics
+;; Internal function to update win-related statistics and performance metrics
+(define-private (update-user-win-stats
+    (user-address principal)
+    (payout-amount uint)
+  )
+  (let ((current-stats (unwrap-panic (map-get? user-stats user-address))))
+    (map-set user-stats user-address
+      (merge current-stats { total-won: (+ (get total-won current-stats) payout-amount) })
+    )
+  )
+)
