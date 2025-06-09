@@ -341,3 +341,92 @@
     )
   )
 )
+
+;; Get Current Platform Statistics
+;; Returns comprehensive platform metrics and configuration parameters
+(define-read-only (get-platform-stats)
+  {
+    total-markets: (var-get market-counter),
+    total-volume: (var-get total-volume),
+    minimum-stake: (var-get minimum-stake),
+    platform-fee-rate: (var-get platform-fee-rate),
+    oracle-address: (var-get oracle-address),
+    contract-balance: (stx-get-balance (as-contract tx-sender)),
+  }
+)
+
+;; Get User Performance Statistics
+;; Returns comprehensive user performance metrics and historical data
+(define-read-only (get-user-performance (user-address principal))
+  (map-get? user-stats user-address)
+)
+
+;; Check Market Status and Eligibility
+;; Determines current market state and prediction eligibility
+(define-read-only (get-market-status (market-id uint))
+  (let (
+      (market-data (unwrap! (map-get? markets market-id) (err "Market not found")))
+      (current-block stacks-block-height)
+    )
+    (ok {
+      is-active: (and
+        (>= current-block (get start-block market-data))
+        (< current-block (get end-block market-data))
+        (not (get resolved market-data))
+      ),
+      is-resolved: (get resolved market-data),
+      blocks-remaining: (if (< current-block (get end-block market-data))
+        (- (get end-block market-data) current-block)
+        u0
+      ),
+    })
+  )
+)
+
+;; ADMINISTRATIVE FUNCTIONS - PLATFORM GOVERNANCE
+
+;; Update Authorized Oracle Address
+;; Changes the oracle address authorized to resolve prediction markets
+(define-public (update-oracle-address (new-oracle-address principal))
+  (let ((old-oracle (var-get oracle-address)))
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-OWNER-ONLY)
+    ;; Validate the new oracle address is a standard principal
+    (asserts! (is-standard new-oracle-address) ERR-INVALID-PARAMETER)
+    ;; Additional safety check: ensure it's not the zero address equivalent
+    (asserts! (not (is-eq new-oracle-address 'SP000000000000000000002Q6VF78))
+      ERR-INVALID-PARAMETER
+    )
+    ;; Ensure we're actually changing the oracle (not setting to same address)
+    (asserts! (not (is-eq old-oracle new-oracle-address)) ERR-INVALID-PARAMETER)
+    (var-set oracle-address new-oracle-address)
+    ;; Emit event for transparency (using print for logging)
+    (print {
+      event: "oracle-updated",
+      old-oracle: old-oracle,
+      new-oracle: new-oracle-address,
+      block-height: stacks-block-height,
+    })
+    (ok true)
+  )
+)
+
+;; Adjust Minimum Stake Requirements
+;; Updates the minimum STX amount required for predictions
+(define-public (update-minimum-stake (new-minimum-amount uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-OWNER-ONLY)
+    (asserts! (> new-minimum-amount u0) ERR-INVALID-PARAMETER)
+    (asserts! (<= new-minimum-amount MAX-STAKE-LIMIT) ERR-INVALID-PARAMETER)
+    (ok (var-set minimum-stake new-minimum-amount))
+  )
+)
+
+;; Modify Platform Fee Structure
+;; Updates the platform fee percentage within acceptable limits
+(define-public (update-platform-fee (new-fee-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-OWNER-ONLY)
+    (asserts! (<= new-fee-rate u1000) ERR-INVALID-PARAMETER) ;; Maximum 10%
+    (ok (var-set platform-fee-rate new-fee-rate))
+  )
+)
